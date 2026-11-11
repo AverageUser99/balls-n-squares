@@ -1,3 +1,5 @@
+import './audio.js';
+
 // Browser plumbing/input only. Picking, dragging and rendering math live in WASM.
 const canvas = document.querySelector('canvas');
 const context = canvas.getContext('2d', { alpha: false });
@@ -12,6 +14,12 @@ let dirty = false;
 let pointer = null;
 let movementTimer;
 let resizeTimer;
+let cameraUnlocked = false;
+let looking = false;
+let cameraMoving = false;
+let settleTimer;
+let lastPointer;
+const keys = new Set();
 
 function fail(error) {
   if (failed) return;
@@ -90,9 +98,10 @@ async function refreshScene() {
     while (dirty && !failed) {
       dirty = false;
       const version = generation;
-      const preview = pointer !== null;
+      const preview = pointer !== null || looking || cameraMoving;
       const [width, height] = dimensions(preview);
       const positions = [0, 1, 2, 3].map(i => control.object_position(i));
+      const camera = [0, 1, 2, 3, 4].map(i => control.camera_value(i));
       if (canvas.width !== width || canvas.height !== height) {
         // Preserve the last image while the new resolution starts rendering.
         const old = document.createElement('canvas');
@@ -108,7 +117,7 @@ async function refreshScene() {
         const end = Math.min(height, coreEnd + 1);
         return { width, fullHeight: height, start, height: Math.max(1, end - start), coreStart, coreHeight: coreEnd - coreStart };
       });
-      await Promise.all(clients.map((client, i) => client.call('resize', { tile: tiles[i], positions, preview })));
+      await Promise.all(clients.map((client, i) => client.call('resize', { tile: tiles[i], positions, camera, preview })));
       if (version !== generation || failed) continue;
       for (let i = 0; i < clients.length; i++) {
         if (tiles[i].coreHeight) renderBand(clients[i], tiles[i], version).catch(fail);
@@ -124,6 +133,15 @@ function coordinates(event) {
 
 canvas.addEventListener('pointerdown', event => {
   if (!ready || failed || pointer !== null || event.button !== 0) return;
+  if (cameraUnlocked) {
+    event.preventDefault();
+    looking = true;
+    lastPointer = [event.clientX, event.clientY];
+    canvas.setPointerCapture(event.pointerId);
+    pointer = event.pointerId;
+    canvas.style.cursor = 'grabbing';
+    return;
+  }
   if (!control.begin_drag(...coordinates(event))) return;
   event.preventDefault();
   pointer = event.pointerId;
@@ -132,7 +150,11 @@ canvas.addEventListener('pointerdown', event => {
   refreshScene().catch(fail);
 });
 canvas.addEventListener('pointermove', event => {
-  if (event.pointerId !== pointer || !control.drag_to(...coordinates(event))) return;
+  if (event.pointerId !== pointer) return;
+  if (looking) {
+    control.look_camera(event.clientX - lastPointer[0], event.clientY - lastPointer[1]);
+    lastPointer = [event.clientX, event.clientY];
+  } else if (!control.drag_to(...coordinates(event))) return;
   event.preventDefault();
   // Coalesce input instead of flooding every worker with obsolete geometry.
   if (!movementTimer) movementTimer = setTimeout(() => {
@@ -142,19 +164,63 @@ canvas.addEventListener('pointermove', event => {
 });
 function finishDrag(event) {
   if (pointer === null || (event?.pointerId !== undefined && event.pointerId !== pointer)) return;
-  if (event?.type === 'pointerup') control.drag_to(...coordinates(event));
-  control.end_drag();
+  if (!looking && event?.type === 'pointerup') control.drag_to(...coordinates(event));
+  if (!looking) control.end_drag();
+  looking = false;
   const released = pointer;
   pointer = null;
   if (canvas.hasPointerCapture(released)) canvas.releasePointerCapture(released);
-  canvas.style.cursor = 'grab';
+  canvas.style.cursor = cameraUnlocked ? 'crosshair' : 'grab';
   clearTimeout(movementTimer); movementTimer = null;
   refreshScene().catch(fail);
 }
 canvas.addEventListener('pointerup', finishDrag);
 canvas.addEventListener('pointercancel', finishDrag);
 canvas.addEventListener('lostpointercapture', finishDrag);
-window.addEventListener('blur', () => finishDrag());
+function cameraChanged() {
+  cameraMoving = true;
+  if (!movementTimer) movementTimer = setTimeout(() => {
+    movementTimer = null;
+    refreshScene().catch(fail);
+  }, 50);
+  clearTimeout(settleTimer);
+  settleTimer = setTimeout(() => {
+    cameraMoving = false;
+    refreshScene().catch(fail);
+  }, 180);
+}
+window.addEventListener('keydown', event => {
+  if (!ready || failed || event.altKey || event.ctrlKey || event.metaKey) return;
+  if (event.code === 'KeyC' && !event.repeat) {
+    finishDrag();
+    cameraUnlocked = !cameraUnlocked;
+    keys.clear();
+    canvas.style.cursor = cameraUnlocked ? 'crosshair' : 'grab';
+    event.preventDefault();
+  } else if (event.code === 'KeyR' && !event.repeat) {
+    finishDrag();
+    control.reset_camera();
+    cameraChanged();
+    event.preventDefault();
+  } else if (cameraUnlocked && ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE'].includes(event.code)) {
+    keys.add(event.code);
+    event.preventDefault();
+  }
+});
+window.addEventListener('keyup', event => keys.delete(event.code));
+let previousFrame = 0;
+function cameraFrame(now) {
+  const dt = previousFrame ? Math.min((now - previousFrame) / 1000, 0.05) : 0;
+  previousFrame = now;
+  if (ready && cameraUnlocked && !document.hidden && keys.size) {
+    const axis = (positive, negative) => Number(keys.has(positive)) - Number(keys.has(negative));
+    if (control.move_camera(axis('KeyD', 'KeyA'), axis('KeyW', 'KeyS'), axis('KeyE', 'KeyQ'), dt)) cameraChanged();
+  }
+  if (!failed) requestAnimationFrame(cameraFrame);
+}
+requestAnimationFrame(cameraFrame);
+window.addEventListener('blur', () => { keys.clear(); finishDrag(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) keys.clear(); });
 window.addEventListener('resize', () => {
   generation++;
   clearTimeout(resizeTimer);
@@ -163,7 +229,7 @@ window.addEventListener('resize', () => {
 window.addEventListener('pagehide', event => {
   if (event.persisted) return;
   generation++; failed = true;
-  clearTimeout(movementTimer); clearTimeout(resizeTimer);
+  clearTimeout(movementTimer); clearTimeout(resizeTimer); clearTimeout(settleTimer);
   for (const client of clients) client.close();
 });
 

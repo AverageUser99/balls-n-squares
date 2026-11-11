@@ -83,6 +83,14 @@ async function freePort() {
     const page = (method, params) => call(method, params, sessionId);
     await page('Runtime.enable');
     await page('Page.enable');
+    await page('Page.addScriptToEvaluateOnNewDocument', { source: `
+      window.__audioStarted = null;
+      const original = AudioBufferSourceNode.prototype.start;
+      AudioBufferSourceNode.prototype.start = function(...args) {
+        window.__audioStarted = { loop: this.loop, duration: this.buffer?.duration, context: this.context };
+        return original.apply(this, args);
+      };
+    ` });
     await page('Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
     if (process.env.TEST_RUNTIME_BAKE) {
       await page('Fetch.enable', { patterns: [{ urlPattern: '*lighting.bin' }] });
@@ -112,7 +120,7 @@ async function freePort() {
     const workerCount = targetInfos.filter(target => target.type === 'worker').length;
     assert.ok(workerCount >= 1);
     console.log('Live WASM workers:', workerCount);
-    assert.equal(landscape.text, '');
+    assert.match(landscape.text, /M\s+Mute\s+C\s+Camera\s+R\s+Reset/);
     // Two short real pointer drags; leave visual/feel tuning to user testing.
     for (const [x, y, toX, toY] of [[510, 540, 420, 555], [760, 540, 840, 555]]) {
       await page('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
@@ -127,6 +135,14 @@ async function freePort() {
       await sleep(300);
     }
     console.log('Sphere and cube pointer drags passed.');
+    const audioDeadline = performance.now() + 15000;
+    let audio;
+    do {
+      await sleep(100);
+      audio = await evaluate('window.__audioStarted && ({loop: window.__audioStarted.loop, duration: window.__audioStarted.duration, state: window.__audioStarted.context.state})');
+    } while (!audio && performance.now() < audioDeadline);
+    assert.ok(audio && audio.loop && audio.duration > 240 && audio.state === 'running', `Music did not start: ${JSON.stringify(audio)} ${JSON.stringify(errors)}`);
+    console.log('Looping music started:', audio);
     const screenshot = await page('Page.captureScreenshot', { format: 'png' });
     mkdirSync(path.join(root, 'target'), { recursive: true });
     writeFileSync(path.join(root, 'target', 'scene.png'), Buffer.from(screenshot.data, 'base64'));
@@ -136,7 +152,7 @@ async function freePort() {
     console.log('Portrait:', portrait);
     assert.ok(portrait.height > portrait.width);
     assert.ok(portrait.litFraction > 0.9);
-    assert.equal(portrait.text, '');
+    assert.match(portrait.text, /M\s+Mute\s+C\s+Camera\s+R\s+Reset/);
     assert.deepEqual(errors, []);
     console.log('Actual Chrome + Python HTTP smoke test passed; screenshot: target/scene.png');
     await call('Browser.close');

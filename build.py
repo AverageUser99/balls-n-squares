@@ -32,10 +32,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
     build()
     build(simd=True)
+    subprocess.run(
+        ["rustc", "--edition=2021", "--crate-type=cdylib", "--target=wasm32-unknown-unknown",
+         "-C", "opt-level=s", "-C", "strip=symbols", "src/audio.rs", "-o", "music.wasm"],
+        cwd=ROOT, check=True,
+    )
+    print(f"Built music.wasm ({(ROOT / 'music.wasm').stat().st_size:,} bytes)")
     if args.site_dir:
         destination = ROOT / args.site_dir
         destination.mkdir(parents=True, exist_ok=True)
-        for name in ["index.html", "app.js", "worker.js", "light_room.wasm", "light_room-simd.wasm"]:
+        for name in ["index.html", "app.js", "audio.js", "worker.js", "light_room.wasm", "light_room-simd.wasm", "music.wasm"]:
             shutil.copyfile(ROOT / name, destination / name)
         (destination / ".nojekyll").touch()
         print(f"Staged static site in {destination}")

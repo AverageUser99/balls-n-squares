@@ -24,7 +24,7 @@ jobs:
           rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
           rustup default stable
 
-      - name: Build scalar and SIMD WASM and stage site
+      - name: Build renderer and embedded music WASM and stage site
         run: python3 build.py --site-dir dist
 
       - name: Quick interaction smoke test

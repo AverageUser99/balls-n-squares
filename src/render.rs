@@ -178,7 +178,7 @@ impl Renderer {
     }
 
     fn camera_hit(&self, x: usize, y: usize, slot: usize) -> CameraHit {
-        let origin = crate::interaction::EYE;
+        let origin = crate::interaction::camera_eye();
         let index = (y * self.width + x) as u32;
         let (jx, jy) = sampling::pair(slot as u32, index ^ 0x51633e2d);
         let aspect = self.width as f32 / self.full_height as f32;

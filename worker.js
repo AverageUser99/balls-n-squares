@@ -13,6 +13,7 @@ self.onmessage = async ({ data: message }) => {
       tile = message.tile;
       preview = !!message.preview;
       wasm.set_objects(...message.positions);
+      wasm.set_camera(...message.camera);
       wasm.interactive(preview ? 1 : 0);
       wasm.resize_tile(tile.width, tile.fullHeight, tile.start, tile.height);
     } else if (type === 'step') {

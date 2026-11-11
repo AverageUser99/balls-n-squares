@@ -5,17 +5,86 @@ use crate::{
 };
 use std::cell::Cell;
 
-pub const EYE: Vec3 = Vec3::new(0.0, 2.45, 8.6);
+const INITIAL_CAMERA: [f32; 5] = [0.0, 2.45, 8.6, 0.0, -0.02221856];
+#[derive(Clone, Copy)]
+struct Camera {
+    values: [f32; 5],
+    forward: Vec3,
+    right: Vec3,
+    up: Vec3,
+}
+impl Camera {
+    fn new(values: [f32; 5]) -> Self {
+        let (sy, cy) = values[3].sin_cos();
+        let (sp, cp) = values[4].sin_cos();
+        Self {
+            values,
+            forward: Vec3::new(sy * cp, sp, -cy * cp),
+            right: Vec3::new(cy, 0.0, sy),
+            up: Vec3::new(-sy * sp, cp, cy * sp),
+        }
+    }
+}
+thread_local! { static CAMERA: Cell<Camera> = Cell::new(Camera::new(INITIAL_CAMERA)); }
+pub fn camera_values() -> [f32; 5] {
+    CAMERA.with(|c| c.get().values)
+}
+pub fn set_camera(mut values: [f32; 5]) {
+    if !values.iter().all(|v| v.is_finite()) {
+        return;
+    }
+    values[4] = values[4].clamp(-1.48, 1.48);
+    CAMERA.with(|c| c.set(Camera::new(values)));
+}
+pub fn reset_camera() {
+    set_camera(INITIAL_CAMERA);
+}
+pub fn camera_eye() -> Vec3 {
+    let p = camera_values();
+    Vec3::new(p[0], p[1], p[2])
+}
 pub fn camera_ray(u: f32, v: f32, aspect: f32) -> Vec3 {
-    let half = 0.40 / aspect.min(1.0).max(0.05);
+    let half = 0.40 / aspect.clamp(0.05, 1.0);
     let x = (u * 2.0 - 1.0) * aspect * half;
     let y = (1.0 - v * 2.0) * half;
-    Vec3::new(
-        x,
-        -0.022216737 + 0.9997532 * y,
-        -0.9997532 - 0.022216737 * y,
-    )
-    .normalized()
+    CAMERA.with(|camera| {
+        let camera = camera.get();
+        (camera.forward + camera.right * x + camera.up * y).normalized()
+    })
+}
+pub fn look(dx: f32, dy: f32) {
+    if !dx.is_finite() || !dy.is_finite() {
+        return;
+    }
+    let mut p = camera_values();
+    p[3] = (p[3] + dx * 0.004).rem_euclid(std::f32::consts::TAU);
+    p[4] -= dy * 0.004;
+    set_camera(p);
+}
+pub fn move_camera(strafe: f32, forward: f32, vertical: f32, dt: f32) -> bool {
+    if ![strafe, forward, vertical, dt]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        return false;
+    }
+    let old = camera_values();
+    let mut p = old;
+    let (sin, cos) = p[3].sin_cos();
+    let length = (strafe * strafe + forward * forward + vertical * vertical)
+        .sqrt()
+        .max(1.0);
+    let speed = 2.5 * dt.clamp(0.0, 0.05) / length;
+    let dx = (strafe * cos + forward * sin) * speed;
+    let dz = (strafe * sin - forward * cos) * speed;
+    p[0] += dx;
+    p[1] += vertical * speed;
+    p[2] += dz;
+    if p == old {
+        return false;
+    }
+    set_camera(p);
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -29,7 +98,7 @@ thread_local! { static DRAG: Cell<Option<Drag>> = const { Cell::new(None) }; }
 
 pub fn begin(u: f32, v: f32, aspect: f32) -> u32 {
     end();
-    let hit = trace(EYE, camera_ray(u, v, aspect));
+    let hit = trace(camera_eye(), camera_ray(u, v, aspect));
     let (object, index) = match hit.surface {
         MIRROR => (1, 0),
         5..=10 => (2, 2),
@@ -60,17 +129,18 @@ pub fn update(u: f32, v: f32, aspect: f32) -> bool {
         return false;
     };
     let direction = camera_ray(u, v, aspect);
-    if direction.y >= -0.005 {
+    if direction.y.abs() < 0.005 {
         return false;
     }
-    let t = (drag.y - EYE.y) / direction.y;
+    let eye = camera_eye();
+    let t = (drag.y - eye.y) / direction.y;
     if t <= 0.0 {
         return false;
     }
-    let target = EYE + direction * t;
+    let target = eye + direction * t;
     let old = positions();
-    let x = (target.x + drag.offset_x).clamp(-1.99, 1.99);
-    let z = (target.z + drag.offset_z).clamp(-1.99, 2.8);
+    let x = target.x + drag.offset_x;
+    let z = target.z + drag.offset_z;
     let candidate = |fraction: f32| {
         let mut p = old;
         p[drag.index] += (x - p[drag.index]) * fraction;

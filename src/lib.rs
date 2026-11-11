@@ -27,6 +27,29 @@ pub extern "C" fn resize_tile(width: u32, full_height: u32, y: u32, height: u32)
     });
 }
 #[no_mangle]
+pub extern "C" fn camera_value(index: u32) -> f32 {
+    interaction::camera_values()
+        .get(index as usize)
+        .copied()
+        .unwrap_or(0.0)
+}
+#[no_mangle]
+pub extern "C" fn set_camera(x: f32, y: f32, z: f32, yaw: f32, pitch: f32) {
+    interaction::set_camera([x, y, z, yaw, pitch]);
+}
+#[no_mangle]
+pub extern "C" fn reset_camera() {
+    interaction::reset_camera();
+}
+#[no_mangle]
+pub extern "C" fn look_camera(dx: f32, dy: f32) {
+    interaction::look(dx, dy);
+}
+#[no_mangle]
+pub extern "C" fn move_camera(strafe: f32, forward: f32, vertical: f32, dt: f32) -> u32 {
+    interaction::move_camera(strafe, forward, vertical, dt) as u32
+}
+#[no_mangle]
 pub extern "C" fn begin_drag(u: f32, v: f32, aspect: f32) -> u32 {
     interaction::begin(u, v, aspect)
 }
