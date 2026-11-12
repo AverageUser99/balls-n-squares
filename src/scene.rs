@@ -8,14 +8,24 @@ pub const TINT: Vec3 = Vec3::new(0.94, 0.96, 0.98);
 pub const EMITTER: usize = 11;
 pub const MIRROR: usize = 12;
 pub const MISS: usize = 13;
+pub const PYRAMID: usize = 14;
+pub const PYRAMID_LIGHT: Vec3 = Vec3::new(3.0, 1.5, 0.55);
+// Three equal-area triangular sides, apex above an equilateral base on the floor.
+const PYRAMID_APEX: Vec3 = Vec3::new(0.0, 0.55, 1.5);
+const PYRAMID_BASE: [Vec3; 3] = [
+    Vec3::new(-0.27, 0.0, 1.34412),
+    Vec3::new(0.27, 0.0, 1.34412),
+    Vec3::new(0.0, 0.0, 1.81177),
+];
+const PYRAMID_AREA: f32 = 0.4632;
 pub const SURFACES: usize = 11;
 thread_local! {
-    static OBJECTS: Cell<[f32; 4]> = const { Cell::new([-1.08, 0.05, 1.08, -0.7]) };
+    static OBJECTS: Cell<[f32; 6]> = const { Cell::new([-1.08, 0.05, 1.08, -0.7, 0.0, 1.5]) };
 }
-pub fn positions() -> [f32; 4] {
+pub fn positions() -> [f32; 6] {
     OBJECTS.with(Cell::get)
 }
-pub fn set_positions(p: [f32; 4]) {
+pub fn set_positions(p: [f32; 6]) {
     if p.iter().all(|v| v.is_finite()) {
         OBJECTS.with(|s| s.set(p));
     }
@@ -182,6 +192,44 @@ fn box_interval(o: Vec3, d: Vec3) -> (f32, usize) {
     }
 }
 
+// Möller–Trumbore works for both normalized camera rays and shadow segments.
+fn pyramid_hit(o: Vec3, d: Vec3) -> (f32, Vec3) {
+    let p = positions();
+    // Intersect in the pyramid's original local frame.
+    let o = o - Vec3::new(p[4], 0.0, p[5] - 1.5);
+    let mut closest = f32::INFINITY;
+    let mut best_normal = Vec3::default();
+    for face in 0..3 {
+        let a = PYRAMID_BASE[face];
+        let b = PYRAMID_BASE[(face + 1) % 3];
+        // This winding points outwards for all three faces.
+        let edge1 = PYRAMID_APEX - a;
+        let edge2 = b - a;
+        let p = d.cross(edge2);
+        let det = edge1.dot(p);
+        if det.abs() < 1e-8 {
+            continue;
+        }
+        let inv = 1.0 / det;
+        let rel = o - a;
+        let u = rel.dot(p) * inv;
+        if !(0.0..=1.0).contains(&u) {
+            continue;
+        }
+        let q = rel.cross(edge1);
+        let v = d.dot(q) * inv;
+        if v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+        let t = edge2.dot(q) * inv;
+        if t > 1e-5 && t < closest {
+            closest = t;
+            best_normal = edge1.cross(edge2).normalized();
+        }
+    }
+    (closest, best_normal)
+}
+
 pub fn trace(o: Vec3, d: Vec3) -> Hit {
     let mut h = Hit::empty();
     // Axis-aligned, inward-facing room planes: no generic dot products.
@@ -228,10 +276,17 @@ pub fn trace(o: Vec3, d: Vec3) -> Hit {
         h.t = cube;
         h.surface = face;
     }
+    let (pyramid, pyramid_normal) = pyramid_hit(o, d);
+    if pyramid > EPS && pyramid < h.t {
+        h.t = pyramid;
+        h.surface = PYRAMID;
+    }
     if h.surface != MISS {
         h.point = o + d * h.t;
         h.n = if h.surface == MIRROR {
             (h.point - sphere_center()).normalized()
+        } else if h.surface == PYRAMID {
+            pyramid_normal
         } else {
             normal(h.surface)
         };
@@ -250,6 +305,10 @@ pub fn occluded(o: Vec3, segment: Vec3) -> bool {
         return true;
     }
     let (t, _) = box_interval(o, segment);
+    if t > 1e-5 && t < 0.9999 {
+        return true;
+    }
+    let (t, _) = pyramid_hit(o, segment);
     t > 1e-5 && t < 0.9999
 }
 
@@ -257,11 +316,35 @@ pub fn direct(point: Vec3, id: usize, u: f32, v: f32) -> Vec3 {
     let o = point + normal(id) * EPS;
     let segment = Vec3::new((u - 0.5) * 1.8, LIGHT_Y, -0.65 + (v - 0.5) * 1.6) - o;
     let cos_product = normal(id).dot(segment).max(0.0) * segment.y.max(0.0);
-    if cos_product <= 0.0 || occluded(o, segment) {
-        return Vec3::default();
+    let mut result = Vec3::default();
+    if cos_product > 0.0 && !occluded(o, segment) {
+        let d2 = segment.dot(segment);
+        result = LIGHT * (cos_product * (2.88 / std::f32::consts::PI) / (d2 * d2));
     }
-    let d2 = segment.dot(segment);
-    LIGHT * (cos_product * (2.88 / std::f32::consts::PI) / (d2 * d2))
+    // Sample a uniformly selected triangular face, then sample its area uniformly.
+    let face_sample = u * 3.0;
+    let face = (face_sample as usize).min(2);
+    let r = (face_sample - face as f32).sqrt();
+    let a = PYRAMID_BASE[face];
+    let b = PYRAMID_BASE[(face + 1) % 3];
+    let emitter_normal = (PYRAMID_APEX - a).cross(b - a).normalized();
+    let p = positions();
+    let translation = Vec3::new(p[4], 0.0, p[5] - 1.5);
+    let light_point = a * (1.0 - r) + PYRAMID_APEX * (r * (1.0 - v)) + b * (r * v) + translation;
+    let to_light = light_point - o;
+    let cos_product = normal(id).dot(to_light).max(0.0) * (-emitter_normal.dot(to_light)).max(0.0);
+    if cos_product > 0.0 {
+        let distance_squared = to_light.dot(to_light);
+        // End slightly before the emitter to avoid self-intersecting its surface.
+        let shortened = to_light * (1.0 - 0.003 / distance_squared.sqrt().max(0.003));
+        if !occluded(o, shortened) {
+            result = result
+                + PYRAMID_LIGHT
+                    * (cos_product * (PYRAMID_AREA / std::f32::consts::PI)
+                        / (distance_squared * distance_squared));
+        }
+    }
+    result
 }
 
 pub fn resolution(id: usize) -> usize {

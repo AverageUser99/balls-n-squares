@@ -237,6 +237,8 @@ impl Renderer {
                 let mut color = Vec3::default();
                 if id == EMITTER {
                     color = LIGHT;
+                } else if id == PYRAMID {
+                    color = PYRAMID_LIGHT;
                 } else if id < SURFACES {
                     // Each cached AA ray gets its own full light sequence. Reusing the
                     // global sample index would lock AA slots to subsets of the light.

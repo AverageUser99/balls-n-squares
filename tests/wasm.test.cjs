@@ -18,6 +18,15 @@ for (const file of ['light_room.wasm', 'light_room-simd.wasm']) {
     assert.equal(w.drag_to(0.68, 0.69, 1.6), 1);
     assert.notEqual(w.object_position(2), oldCubeX);
     w.end_drag();
+    assert.equal(w.begin_drag(0.5, 0.84, 1.6), 3);
+    const pyramidX = w.object_position(4);
+    assert.equal(w.drag_to(0.54, 0.84, 1.6), 1);
+    assert.notEqual(w.object_position(4), pyramidX);
+    const worker = new WebAssembly.Instance(module, {}).exports;
+    worker.set_objects(...Array.from({ length: 6 }, (_, i) => w.object_position(i)));
+    assert.equal(worker.object_position(4), w.object_position(4));
+    assert.equal(worker.object_position(5), w.object_position(5));
+    w.end_drag();
     const initial = Array.from({ length: 5 }, (_, i) => w.camera_value(i));
     w.look_camera(100, -40);
     assert.notEqual(w.camera_value(3), initial[3]);

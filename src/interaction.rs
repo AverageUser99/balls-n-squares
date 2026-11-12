@@ -102,6 +102,7 @@ pub fn begin(u: f32, v: f32, aspect: f32) -> u32 {
     let (object, index) = match hit.surface {
         MIRROR => (1, 0),
         5..=10 => (2, 2),
+        PYRAMID => (3, 4),
         _ => return 0,
     };
     let p = positions();
@@ -116,12 +117,19 @@ pub fn begin(u: f32, v: f32, aspect: f32) -> u32 {
     object
 }
 
-fn clear(p: [f32; 4]) -> bool {
-    // Conservative sphere/rotated-box footprint collision keeps both objects separate.
-    let q = rotate(Vec3::new(p[0] - p[2], 0.0, p[1] - p[3]), true);
-    let dx = q.x - q.x.clamp(-0.78, 0.78);
-    let dz = q.z - q.z.clamp(-0.78, 0.78);
-    dx * dx + dz * dz >= 1.02 * 1.02
+fn clear(p: [f32; 6]) -> bool {
+    // Conservative floor footprints prevent the three objects intersecting.
+    let outside_cube = |x: f32, z: f32, radius: f32| {
+        let q = rotate(Vec3::new(x - p[2], 0.0, z - p[3]), true);
+        let dx = q.x - q.x.clamp(-0.78, 0.78);
+        let dz = q.z - q.z.clamp(-0.78, 0.78);
+        dx * dx + dz * dz >= radius * radius
+    };
+    let dx = p[0] - p[4];
+    let dz = p[1] - p[5];
+    outside_cube(p[0], p[1], 1.02)
+        && outside_cube(p[4], p[5], 0.33)
+        && dx * dx + dz * dz >= 1.33 * 1.33
 }
 
 pub fn update(u: f32, v: f32, aspect: f32) -> bool {

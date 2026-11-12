@@ -18,9 +18,15 @@ pub fn path(
         if hit.surface == MISS {
             break;
         }
-        if hit.surface == EMITTER {
+        if hit.surface == EMITTER || hit.surface == PYRAMID {
             if specular {
-                result = result + throughput * LIGHT;
+                result = result
+                    + throughput
+                        * if hit.surface == EMITTER {
+                            LIGHT
+                        } else {
+                            PYRAMID_LIGHT
+                        };
             }
             break;
         }

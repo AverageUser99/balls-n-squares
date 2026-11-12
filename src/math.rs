@@ -17,6 +17,13 @@ impl Vec3 {
     pub fn dot(self, rhs: Self) -> f32 {
         self.x * rhs.x + self.y * rhs.y + self.z * rhs.z
     }
+    pub fn cross(self, other: Self) -> Self {
+        Self::new(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x,
+        )
+    }
     pub fn normalized(self) -> Self {
         self / self.dot(self).sqrt().max(1e-10)
     }

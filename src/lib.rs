@@ -70,8 +70,8 @@ pub extern "C" fn object_position(index: u32) -> f32 {
 }
 // Worker synchronization: followed by resize_tile() to invalidate cached paths.
 #[no_mangle]
-pub extern "C" fn set_objects(sx: f32, sz: f32, cx: f32, cz: f32) {
-    scene::set_positions([sx, sz, cx, cz]);
+pub extern "C" fn set_objects(sx: f32, sz: f32, cx: f32, cz: f32, px: f32, pz: f32) {
+    scene::set_positions([sx, sz, cx, cz, px, pz]);
 }
 #[no_mangle]
 pub extern "C" fn interactive(preview: u32) {
@@ -190,6 +190,21 @@ mod tests {
         let h = trace(Vec3::new(1.08, 4.0, -0.7), Vec3::new(0.0, -1.0, 0.0));
         assert!((h.t - 2.2).abs() < 0.0001);
         assert!((h.n.y - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn pyramid_is_visible_and_lights_nearby_floor() {
+        let hit = trace(Vec3::new(0.0, 0.2, 3.0), Vec3::new(0.0, 0.0, -1.0));
+        assert_eq!(hit.surface, PYRAMID);
+        assert!(hit.n.z > 0.0);
+        let point = Vec3::new(0.0, 0.0, 2.2);
+        let mut total = Vec3::default();
+        for sample in 0..128 {
+            let (u, v) = sampling::pair(sample, 7);
+            total = total + direct(point, 0, u, v);
+        }
+        // The warm emitter adds red light beyond the ceiling light's fixed ratio.
+        assert!(total.x / total.z > LIGHT.x / LIGHT.z + 0.05);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 **[Play the live scene](https://averageuser99.github.io/balls-n-squares/)** · [Source](https://github.com/AverageUser99/balls-n-squares)
 
-A Rust/WASM CPU ray tracer: room, mirror sphere, cube, area light, soft shadows,
+A Rust/WASM CPU ray tracer: room, mirror sphere, cube, glowing triangular pyramid, area light, soft shadows,
 and bounced light. A small overlay shows keyboard shortcuts; there is no GPU/shader renderer.
 
 ## Run
@@ -15,7 +15,7 @@ python -m http.server 8000
 
 Open **http://localhost:8000**. Music loops automatically when browser settings allow it;
 otherwise it starts after your first click, tap, or keypress. Press **M** to mute/unmute.
-**Click/touch and drag the sphere or cube** to move
+**Click/touch and drag the sphere, cube, or glowing pyramid** to move
 it across the floor. Objects can move beyond the room, but cannot pass through each other.
 Release to refine the image. Dragging up/down changes depth, not object height.
 

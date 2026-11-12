@@ -100,7 +100,7 @@ async function refreshScene() {
       const version = generation;
       const preview = pointer !== null || looking || cameraMoving;
       const [width, height] = dimensions(preview);
-      const positions = [0, 1, 2, 3].map(i => control.object_position(i));
+      const positions = [0, 1, 2, 3, 4, 5].map(i => control.object_position(i));
       const camera = [0, 1, 2, 3, 4].map(i => control.camera_value(i));
       if (canvas.width !== width || canvas.height !== height) {
         // Preserve the last image while the new resolution starts rendering.
