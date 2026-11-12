@@ -71,8 +71,8 @@ async function loadModule() {
 function dimensions(preview) {
   const w = Math.max(1, window.innerWidth);
   const h = Math.max(1, window.innerHeight);
-  const edge = preview ? 320 : 640;
-  const budget = preview ? 36864 : 147456;
+  const edge = preview ? 320 : 960;
+  const budget = preview ? 36864 : 331776;
   const scale = Math.min(1, edge / w, edge / h, Math.sqrt(budget / (w * h)));
   return [Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale))];
 }

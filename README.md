@@ -43,7 +43,7 @@ Release to refine the image. Dragging up/down changes depth, not object height.
   Buffers are reused rather than reallocated on every drag.
 - Up to four independent WASM workers, SIMD with scalar fallback, specialized shadow
   tests, Sobol light sampling, and lookup-table display conversion remain enabled.
-- Preview is capped at 36,864 pixels/320 long edge; refinement at 147,456 pixels/640.
+- Preview is capped at 36,864 pixels/320 long edge; refinement at 331,776 pixels/960.
 
 All picking, floor dragging, collision constraints, tracing, and filtering math executes
 in WASM. JavaScript handles pointer events, worker messages, and displaying RGBA pixels.
