@@ -9,6 +9,18 @@ const AA: usize = 8;
 const MAX_SAMPLES: u32 = 512;
 const INVALID: u32 = u32::MAX;
 const MIRRORED: u32 = 256;
+// Bound only stochastic bounced radiance, before averaging. Scaling RGB together
+// preserves hue; visible emitters and directly sampled light remain untouched.
+const INDIRECT_LUMINANCE_LIMIT: f32 = 2.0;
+
+fn clamp_indirect(value: Vec3) -> Vec3 {
+    let luminance = value.luminance();
+    if luminance > INDIRECT_LUMINANCE_LIMIT {
+        value * (INDIRECT_LUMINANCE_LIMIT / luminance)
+    } else {
+        value
+    }
+}
 
 #[derive(Clone, Copy)]
 struct CameraHit {
@@ -238,27 +250,33 @@ impl Renderer {
                     } else {
                         None
                     };
+                    let indirect = match cached {
+                        Some(value) => value,
+                        None => {
+                            let mut rng =
+                                Rng::new(global.wrapping_mul(512).wrapping_add(pixel.count));
+                            let d = sampling::cosine(id, rng.next(), rng.next());
+                            lighting::path(
+                                hit.point + normal(id) * EPS,
+                                d,
+                                &mut rng,
+                                false,
+                                if !self.live {
+                                    5
+                                } else if self.preview {
+                                    1
+                                } else {
+                                    3
+                                },
+                            )
+                        }
+                    };
+                    // Cached values are already averaged; clamp individual paths only.
                     incoming = incoming
-                        + match cached {
-                            Some(value) => value,
-                            None => {
-                                let mut rng =
-                                    Rng::new(global.wrapping_mul(512).wrapping_add(pixel.count));
-                                let d = sampling::cosine(id, rng.next(), rng.next());
-                                lighting::path(
-                                    hit.point + normal(id) * EPS,
-                                    d,
-                                    &mut rng,
-                                    false,
-                                    if !self.live {
-                                        5
-                                    } else if self.preview {
-                                        1
-                                    } else {
-                                        3
-                                    },
-                                )
-                            }
+                        + if cached.is_some() {
+                            indirect
+                        } else {
+                            clamp_indirect(indirect)
                         };
                     color = incoming * albedo(id);
                 }
@@ -294,7 +312,12 @@ impl Renderer {
                 if self.options & 4 == 0 && pixel.count >= 16 && guide.surface() < SURFACES {
                     // Reflections are guided by the *reflected* face and world position,
                     // not merely the smooth sphere normal: reflected edges remain sharp.
-                    let fade = (64.0 / pixel.count as f32).min(1.0) * 0.4;
+                    let center_luminance = center.luminance();
+                    // Dark pixels show isolated noise most clearly. Retain a modest
+                    // filter there even after convergence; brightly lit areas keep
+                    // the existing, diminishing filter strength.
+                    let dark = (1.0 - center_luminance / 0.12).clamp(0.0, 1.0);
+                    let fade = (64.0 / pixel.count as f32).min(1.0) * 0.4 + dark * 0.35;
                     for dy in -1..=1 {
                         for dx in -1..=1 {
                             if dx == 0 && dy == 0 {
@@ -320,9 +343,9 @@ impl Renderer {
                                 continue;
                             }
                             let value = other.average();
-                            let difference = (value.luminance() - center.luminance()).abs();
+                            let difference = (value.luminance() - center_luminance).abs();
                             let sigma = (pixel.variance() + other.variance()).sqrt();
-                            let range = 0.015 + sigma * 2.0;
+                            let range = 0.015 + sigma * 2.0 + dark * 0.015;
                             let weight = fade
                                 / (1.0 + (difference / range).powi(2))
                                 / (dx * dx + dy * dy) as f32;
@@ -344,6 +367,17 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn indirect_clamp_preserves_dim_values_and_hue() {
+        let dim = Vec3::new(0.1, 0.3, 0.2);
+        let result = clamp_indirect(dim);
+        assert_eq!((result.x, result.y, result.z), (dim.x, dim.y, dim.z));
+        let bright = Vec3::new(8.0, 4.0, 2.0);
+        let result = clamp_indirect(bright);
+        assert!((result.luminance() - INDIRECT_LUMINANCE_LIMIT).abs() < 1e-5);
+        assert!((result.x / result.y - 2.0).abs() < 1e-5);
+        assert!((result.y / result.z - 2.0).abs() < 1e-5);
+    }
     #[test]
     fn lut_stays_within_one_display_level() {
         let r = Renderer::default();
