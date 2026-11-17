@@ -4,63 +4,53 @@ use crate::{
     scene::*,
 };
 
-pub fn path(
-    mut origin: Vec3,
-    mut direction: Vec3,
-    rng: &mut Rng,
-    mut specular: bool,
-    limit: usize,
-) -> Vec3 {
-    let mut result = Vec3::default();
-    let mut throughput = Vec3::new(1.0, 1.0, 1.0);
-    for depth in 0..limit {
-        let hit = trace(origin, direction);
-        if hit.surface == MISS {
-            break;
-        }
-        if hit.surface == EMITTER || hit.surface == PYRAMID {
-            if specular {
-                result = result
-                    + throughput
-                        * if hit.surface == EMITTER {
-                            LIGHT
-                        } else {
-                            PYRAMID_LIGHT
-                        };
-            }
-            break;
-        }
-        origin = hit.point + hit.n * EPS;
-        if hit.surface == MIRROR {
-            if depth + 1 == limit {
-                break;
-            }
-            throughput = throughput * TINT;
-            direction = direction.reflect(hit.n);
-            specular = true;
-            continue;
-        }
-        result = result
-            + throughput
-                * albedo(hit.surface)
-                * direct(hit.point, hit.surface, rng.next(), rng.next());
-        // Neither a direction nor a roulette draw is useful on the final bounce.
-        if depth + 1 == limit {
-            break;
-        }
-        throughput = throughput * albedo(hit.surface);
-        if depth >= 2 {
-            let survival = throughput.max_component().clamp(0.1, 0.9);
-            if rng.next() >= survival {
-                break;
-            }
-            throughput = throughput / survival;
-        }
-        // Roulette precedes expensive direction sampling; expectation is unchanged.
-        direction = sampling::cosine(hit.surface, rng.next(), rng.next());
-        specular = false;
+// One diffuse indirect segment. Directly sampled emitters are not counted twice.
+pub fn one_bounce(origin: Vec3, direction: Vec3, rng: &mut Rng) -> Vec3 {
+    let hit = trace(origin, direction);
+    if hit.surface < SURFACES {
+        albedo(hit.surface) * direct(hit.point, hit.surface, rng.next(), rng.next())
+    } else {
+        Vec3::default()
     }
-    result
+}
+
+// Small view-independent irradiance grid; the sample directions stay fixed on
+// each face as objects move. Only geometry edits require rebuilding it.
+const GRID: usize = 8;
+#[derive(Default)]
+pub struct LiveCache {
+    geometry: Option<[f32; 6]>,
+    values: Vec<Vec3>,
+}
+impl LiveCache {
+    pub fn prepare(&mut self) {
+        let geometry = positions();
+        if self.geometry == Some(geometry) {
+            return;
+        }
+        self.values.clear();
+        for id in 0..SURFACES {
+            for cell in 0..GRID * GRID {
+                let p = surface_point(
+                    id,
+                    ((cell % GRID) as f32 + 0.5) / GRID as f32,
+                    ((cell / GRID) as f32 + 0.5) / GRID as f32,
+                ) + normal(id) * EPS;
+                let seed = (id * GRID * GRID + cell) as u32;
+                let mut sum = Vec3::default();
+                for s in 0..32 {
+                    let (u, v) = sampling::pair(s, seed);
+                    let mut rng = Rng::new(seed * 32 + s);
+                    sum = sum + one_bounce(p, sampling::cosine(id, u, v), &mut rng);
+                }
+                self.values.push(sum / 32.0);
+            }
+        }
+        self.geometry = Some(geometry);
+    }
+    pub fn lookup(&self, id: usize, p: Vec3) -> Option<Vec3> {
+        interpolate(&self.values, id, p, GRID, id * GRID * GRID)
+    }
 }
 
 pub struct Lighting {
@@ -101,7 +91,7 @@ impl Lighting {
                 let (u, v) = sampling::pair(sample, index as u32 ^ 0xa511e9b3);
                 let direction = sampling::cosine(id, u, v);
                 let mut rng = Rng::new((index as u32).wrapping_mul(512).wrapping_add(sample));
-                let value = path(p + normal(id) * EPS, direction, &mut rng, false, 5);
+                let value = one_bounce(p + normal(id) * EPS, direction, &mut rng);
                 sum = sum + value;
                 count += 1;
                 let delta = value.luminance() - mean;
@@ -152,21 +142,23 @@ impl Lighting {
         if !self.ready || id >= SURFACES {
             return None;
         }
-        let (u, v) = surface_uv(id, p);
-        // Rays can see beyond the mapped room through the mirror. Trace those normally.
-        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
-            return None;
-        }
-        let res = resolution(id);
-        let x = (u * res as f32 - 0.5).clamp(0.0, (res - 1) as f32);
-        let y = (v * res as f32 - 0.5).clamp(0.0, (res - 1) as f32);
-        let (ix, iy) = (x as usize, y as usize);
-        let (fx, fy) = (x - ix as f32, y - iy as f32);
-        let base = offset(id);
-        let at = |a: usize, b: usize| self.values[base + b.min(res - 1) * res + a.min(res - 1)];
-        Some(
-            (at(ix, iy) * (1.0 - fx) + at(ix + 1, iy) * fx) * (1.0 - fy)
-                + (at(ix, iy + 1) * (1.0 - fx) + at(ix + 1, iy + 1) * fx) * fy,
-        )
+        interpolate(&self.values, id, p, resolution(id), offset(id))
     }
+}
+
+fn interpolate(values: &[Vec3], id: usize, p: Vec3, res: usize, base: usize) -> Option<Vec3> {
+    let (u, v) = surface_uv(id, p);
+    // Rays can see beyond the mapped room through the mirror. Trace those normally.
+    if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+        return None;
+    }
+    let x = (u * res as f32 - 0.5).clamp(0.0, (res - 1) as f32);
+    let y = (v * res as f32 - 0.5).clamp(0.0, (res - 1) as f32);
+    let (ix, iy) = (x as usize, y as usize);
+    let (fx, fy) = (x - ix as f32, y - iy as f32);
+    let at = |a: usize, b: usize| values[base + b.min(res - 1) * res + a.min(res - 1)];
+    Some(
+        (at(ix, iy) * (1.0 - fx) + at(ix + 1, iy) * fx) * (1.0 - fy)
+            + (at(ix, iy + 1) * (1.0 - fx) + at(ix + 1, iy + 1) * fx) * fy,
+    )
 }

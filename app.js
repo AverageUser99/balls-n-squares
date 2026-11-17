@@ -3,21 +3,17 @@ import './audio.js';
 // Browser plumbing/input only. Picking, dragging and rendering math live in WASM.
 const canvas = document.querySelector('canvas');
 const context = canvas.getContext('2d', { alpha: false });
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Render work is dispatched by the animation loop, not by input events.
 const clients = [];
 let control;
-let generation = 0;
 let ready = false;
 let failed = false;
 let refreshing = false;
 let dirty = false;
 let pointer = null;
-let movementTimer;
 let resizeTimer;
 let cameraUnlocked = false;
 let looking = false;
-let cameraMoving = false;
-let settleTimer;
 let lastPointer;
 const keys = new Set();
 
@@ -68,61 +64,47 @@ async function loadModule() {
   }
 }
 
-function dimensions(preview) {
+function dimensions() {
   const w = Math.max(1, window.innerWidth);
   const h = Math.max(1, window.innerHeight);
-  const edge = preview ? 320 : 640;
-  const budget = preview ? 36864 : 147456;
+  const edge = 320;
+  const budget = 36864;
   const scale = Math.min(1, edge / w, edge / h, Math.sqrt(budget / (w * h)));
   return [Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale))];
 }
 
-async function renderBand(client, tile, version) {
-  while (version === generation && !failed) {
-    if (document.hidden) { await sleep(150); continue; }
-    const result = await client.call('step');
-    if (version !== generation || failed) return;
-    context.putImageData(new ImageData(result.pixels, tile.width, tile.coreHeight), 0, tile.coreStart);
-    if (!result.active) return;
-  }
+function snapshot() {
+  const [width, height] = dimensions();
+  const positions = Array.from({ length: 6 }, (_, i) => control.object_position(i));
+  const camera = Array.from({ length: 5 }, (_, i) => control.camera_value(i));
+  const count = Math.min(clients.length, height);
+  const bands = clients.slice(0, count).map((client, i) => {
+    const coreStart = Math.floor(i * height / count);
+    const coreEnd = Math.floor((i + 1) * height / count);
+    const tile = { width, fullHeight: height, coreStart, coreHeight: coreEnd - coreStart };
+    return { client, tile };
+  });
+  return { width, height, positions, camera, bands };
 }
 
-async function refreshScene() {
-  if (!ready || failed) return;
-  dirty = true;
-  generation++;
-  if (refreshing) return;
+async function renderFrame() {
+  if (!ready || failed || refreshing || document.hidden || !dirty) return;
   refreshing = true;
   try {
-    // At most one scene update in flight. Rapid drags replace stale updates.
-    while (dirty && !failed) {
-      dirty = false;
-      const version = generation;
-      const preview = pointer !== null || looking || cameraMoving;
-      const [width, height] = dimensions(preview);
-      const positions = [0, 1, 2, 3, 4, 5].map(i => control.object_position(i));
-      const camera = [0, 1, 2, 3, 4].map(i => control.camera_value(i));
-      if (canvas.width !== width || canvas.height !== height) {
-        // Preserve the last image while the new resolution starts rendering.
-        const old = document.createElement('canvas');
-        old.width = canvas.width; old.height = canvas.height;
-        old.getContext('2d').drawImage(canvas, 0, 0);
-        canvas.width = width; canvas.height = height;
-        context.drawImage(old, 0, 0, width, height);
-      }
-      const tiles = clients.map((client, i) => {
-        const coreStart = Math.floor(i * height / clients.length);
-        const coreEnd = Math.floor((i + 1) * height / clients.length);
-        const start = Math.max(0, coreStart - 1);
-        const end = Math.min(height, coreEnd + 1);
-        return { width, fullHeight: height, start, height: Math.max(1, end - start), coreStart, coreHeight: coreEnd - coreStart };
-      });
-      await Promise.all(clients.map((client, i) => client.call('resize', { tile: tiles[i], positions, camera, preview })));
-      if (version !== generation || failed) continue;
-      for (let i = 0; i < clients.length; i++) {
-        if (tiles[i].coreHeight) renderBand(clients[i], tiles[i], version).catch(fail);
-      }
-    }
+    dirty = false;
+    const { width, height, positions, camera, bands } = snapshot();
+    const results = await Promise.all(bands.map(({ client, tile }) =>
+      client.call('render', { tile, positions, camera })
+    ));
+    // Finish motion frames even when input outruns rendering. The next snapshot
+    // picks up the latest pose instead of repeatedly cancelling unseen frames.
+    if (failed) return;
+    // Resize and paint together in one task: the compositor sees a whole pose.
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+    bands.forEach(({ tile }, i) => {
+      context.putImageData(new ImageData(results[i].pixels, width, tile.coreHeight), 0, tile.coreStart);
+    });
   } finally { refreshing = false; }
 }
 
@@ -147,7 +129,6 @@ canvas.addEventListener('pointerdown', event => {
   pointer = event.pointerId;
   canvas.setPointerCapture(pointer);
   canvas.style.cursor = 'grabbing';
-  refreshScene().catch(fail);
 });
 canvas.addEventListener('pointermove', event => {
   if (event.pointerId !== pointer) return;
@@ -156,39 +137,21 @@ canvas.addEventListener('pointermove', event => {
     lastPointer = [event.clientX, event.clientY];
   } else if (!control.drag_to(...coordinates(event))) return;
   event.preventDefault();
-  // Coalesce input instead of flooding every worker with obsolete geometry.
-  if (!movementTimer) movementTimer = setTimeout(() => {
-    movementTimer = null;
-    refreshScene().catch(fail);
-  }, 50);
+  dirty = true;
 });
 function finishDrag(event) {
   if (pointer === null || (event?.pointerId !== undefined && event.pointerId !== pointer)) return;
-  if (!looking && event?.type === 'pointerup') control.drag_to(...coordinates(event));
+  if (!looking && event?.type === 'pointerup' && control.drag_to(...coordinates(event))) dirty = true;
   if (!looking) control.end_drag();
   looking = false;
   const released = pointer;
   pointer = null;
   if (canvas.hasPointerCapture(released)) canvas.releasePointerCapture(released);
   canvas.style.cursor = cameraUnlocked ? 'crosshair' : 'grab';
-  clearTimeout(movementTimer); movementTimer = null;
-  refreshScene().catch(fail);
 }
 canvas.addEventListener('pointerup', finishDrag);
 canvas.addEventListener('pointercancel', finishDrag);
 canvas.addEventListener('lostpointercapture', finishDrag);
-function cameraChanged() {
-  cameraMoving = true;
-  if (!movementTimer) movementTimer = setTimeout(() => {
-    movementTimer = null;
-    refreshScene().catch(fail);
-  }, 50);
-  clearTimeout(settleTimer);
-  settleTimer = setTimeout(() => {
-    cameraMoving = false;
-    refreshScene().catch(fail);
-  }, 180);
-}
 window.addEventListener('keydown', event => {
   if (!ready || failed || event.altKey || event.ctrlKey || event.metaKey) return;
   if (event.code === 'KeyC' && !event.repeat) {
@@ -200,7 +163,7 @@ window.addEventListener('keydown', event => {
   } else if (event.code === 'KeyR' && !event.repeat) {
     finishDrag();
     control.reset_camera();
-    cameraChanged();
+    dirty = true;
     event.preventDefault();
   } else if (cameraUnlocked && ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE'].includes(event.code)) {
     keys.add(event.code);
@@ -214,22 +177,22 @@ function cameraFrame(now) {
   previousFrame = now;
   if (ready && cameraUnlocked && !document.hidden && keys.size) {
     const axis = (positive, negative) => Number(keys.has(positive)) - Number(keys.has(negative));
-    if (control.move_camera(axis('KeyD', 'KeyA'), axis('KeyW', 'KeyS'), axis('KeyE', 'KeyQ'), dt)) cameraChanged();
+    if (control.move_camera(axis('KeyD', 'KeyA'), axis('KeyW', 'KeyS'), axis('KeyE', 'KeyQ'), dt)) dirty = true;
   }
+  if (dirty) renderFrame().catch(fail);
   if (!failed) requestAnimationFrame(cameraFrame);
 }
 requestAnimationFrame(cameraFrame);
 window.addEventListener('blur', () => { keys.clear(); finishDrag(); });
 document.addEventListener('visibilitychange', () => { if (document.hidden) keys.clear(); });
 window.addEventListener('resize', () => {
-  generation++;
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => refreshScene().catch(fail), 80);
+  resizeTimer = setTimeout(() => { dirty = true; }, 80);
 });
 window.addEventListener('pagehide', event => {
   if (event.persisted) return;
-  generation++; failed = true;
-  clearTimeout(movementTimer); clearTimeout(resizeTimer); clearTimeout(settleTimer);
+  failed = true;
+  clearTimeout(resizeTimer);
   for (const client of clients) client.close();
 });
 
@@ -241,6 +204,6 @@ async function start() {
   for (let i = 0; i < count; i++) clients.push(new RendererWorker());
   await Promise.all(clients.map(client => client.call('init', { module })));
   ready = true;
-  await refreshScene();
+  dirty = true;
 }
 start().catch(fail);

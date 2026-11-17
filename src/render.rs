@@ -119,6 +119,7 @@ fn tone(linear: f32, lut: &[f32]) -> u8 {
 
 pub struct Renderer {
     pub lighting: Lighting,
+    live_cache: lighting::LiveCache,
     pub pixels: Vec<u8>,
     pub passes: u32,
     pub active: usize,
@@ -131,6 +132,7 @@ pub struct Renderer {
     options: u32,
     live: bool,
     preview: bool,
+    mode_changed: bool,
     state: Vec<Pixel>,
     camera: Vec<CameraHit>,
     lut: Vec<f32>,
@@ -139,6 +141,7 @@ impl Default for Renderer {
     fn default() -> Self {
         Self {
             lighting: Lighting::default(),
+            live_cache: lighting::LiveCache::default(),
             pixels: Vec::new(),
             passes: 0,
             active: 0,
@@ -151,6 +154,7 @@ impl Default for Renderer {
             options: 0,
             live: false,
             preview: false,
+            mode_changed: false,
             state: Vec::new(),
             camera: Vec::new(),
             lut: (0..=4096)
@@ -165,8 +169,9 @@ impl Renderer {
     }
     pub fn interactive(&mut self, preview: bool) {
         self.live = true;
+        self.mode_changed |= self.preview != preview;
         self.preview = preview;
-        self.options |= 1; // Moving objects invalidate all static irradiance maps.
+        self.live_cache.prepare();
         self.lighting.ready = false;
     }
     pub fn resize(&mut self, width: usize, full_height: usize, y_start: usize, height: usize) {
@@ -178,21 +183,23 @@ impl Renderer {
         self.row = 0;
         self.evaluated = 0;
         self.active = self.width * self.height;
-        // Reuse allocations on scene edits instead of reallocating the whole camera cache.
-        self.state.resize(self.active, Pixel::default());
-        self.state.fill(Pixel::default());
-        self.camera.resize(self.active * AA, CameraHit::default());
-        self.camera.fill(CameraHit::default());
+        self.mode_changed = false;
         self.pixels.resize(self.active * 4, 0);
+        if self.preview {
+            // Keep still allocations for reuse, but don't touch them during motion.
+            return;
+        }
+        self.state.clear();
+        self.state.resize(self.active, Pixel::default());
+        self.camera.clear();
+        self.camera.resize(self.active * AA, CameraHit::default());
         for p in self.pixels.chunks_exact_mut(4) {
             p[3] = 255;
         }
     }
 
-    fn camera_hit(&self, x: usize, y: usize, slot: usize) -> CameraHit {
+    fn camera_hit(&self, x: usize, y: usize, (jx, jy): (f32, f32)) -> CameraHit {
         let origin = crate::interaction::camera_eye();
-        let index = (y * self.width + x) as u32;
-        let (jx, jy) = sampling::pair(slot as u32, index ^ 0x51633e2d);
         let aspect = self.width as f32 / self.full_height as f32;
         let mut direction = crate::interaction::camera_ray(
             (x as f32 + jx) / self.width as f32,
@@ -213,8 +220,59 @@ impl Renderer {
         }
     }
 
+    fn render_preview(&mut self, rows: usize) {
+        let end = self.row + rows.min(self.height - self.row);
+        for y in self.row..end {
+            for x in 0..self.width {
+                let hit = self.camera_hit(x, y + self.y_start, (0.5, 0.5));
+                let id = hit.surface();
+                let value = match id {
+                    EMITTER => LIGHT,
+                    PYRAMID => PYRAMID_LIGHT,
+                    // Fixed direct sample; the bounced term is shared with still frames.
+                    id if id < SURFACES => {
+                        let indirect = self.live_cache.lookup(id, hit.point).unwrap_or_else(|| {
+                            let mut rng = Rng::new(id as u32);
+                            let d = sampling::cosine(id, rng.next(), rng.next());
+                            clamp_indirect(lighting::one_bounce(
+                                hit.point + normal(id) * EPS,
+                                d,
+                                &mut rng,
+                            ))
+                        });
+                        (direct(hit.point, id, 0.5, 0.5) + indirect) * albedo(id)
+                    }
+                    _ => Vec3::default(),
+                } * hit.tint();
+                let i = (y * self.width + x) * 4;
+                self.pixels[i..i + 4].copy_from_slice(&[
+                    tone(value.x, &self.lut),
+                    tone(value.y, &self.lut),
+                    tone(value.z, &self.lut),
+                    255,
+                ]);
+            }
+        }
+        let count = (end - self.row) * self.width;
+        self.active -= count;
+        self.evaluated += count as u32;
+        self.row = end;
+        self.passes = (end == self.height) as u32;
+    }
+
+    fn reset_changed_mode(&mut self) {
+        if self.mode_changed && self.width != 0 {
+            self.resize(self.width, self.full_height, self.y_start, self.height);
+        }
+    }
+
     pub fn render(&mut self, rows: usize) {
+        self.reset_changed_mode();
         if self.width == 0 || self.active == 0 {
+            return;
+        }
+        if self.preview {
+            self.render_preview(rows);
             return;
         }
         for _ in 0..rows.min(self.height) {
@@ -229,7 +287,12 @@ impl Renderer {
                 let cache_index = index * AA + slot;
                 let mut hit = self.camera[cache_index];
                 if hit.tag == INVALID || self.options & 8 != 0 {
-                    hit = self.camera_hit(x, y + self.y_start, slot);
+                    let global = ((y + self.y_start) * self.width + x) as u32;
+                    hit = self.camera_hit(
+                        x,
+                        y + self.y_start,
+                        sampling::pair(slot as u32, global ^ 0x51633e2d),
+                    );
                     self.camera[cache_index] = hit;
                 }
                 let id = hit.surface();
@@ -247,7 +310,9 @@ impl Renderer {
                         global ^ (slot as u32).wrapping_mul(0x9e3779b9) ^ 0xb5297a4d,
                     );
                     let mut incoming = direct(hit.point, id, u, v);
-                    let cached = if self.options & 1 == 0 {
+                    let cached = if self.live {
+                        self.live_cache.lookup(id, hit.point)
+                    } else if self.options & 1 == 0 {
                         self.lighting.lookup(id, hit.point)
                     } else {
                         None
@@ -258,19 +323,7 @@ impl Renderer {
                             let mut rng =
                                 Rng::new(global.wrapping_mul(512).wrapping_add(pixel.count));
                             let d = sampling::cosine(id, rng.next(), rng.next());
-                            lighting::path(
-                                hit.point + normal(id) * EPS,
-                                d,
-                                &mut rng,
-                                false,
-                                if !self.live {
-                                    5
-                                } else if self.preview {
-                                    1
-                                } else {
-                                    3
-                                },
-                            )
+                            lighting::one_bounce(hit.point + normal(id) * EPS, d, &mut rng)
                         }
                     };
                     // Cached values are already averaged; clamp individual paths only.
@@ -283,7 +336,7 @@ impl Renderer {
                     color = incoming * albedo(id);
                 }
                 self.state[index].add(color * hit.tint(), self.options & 2 == 0);
-                if self.live && self.state[index].count >= if self.preview { 32 } else { 256 } {
+                if self.live && self.state[index].count >= 256 {
                     self.state[index].done = true;
                 }
                 self.evaluated += 1;
@@ -303,6 +356,10 @@ impl Renderer {
     }
 
     pub fn present(&mut self) {
+        self.reset_changed_mode();
+        if self.preview {
+            return; // Preview writes display-ready RGBA as each row is traced.
+        }
         for y in 0..self.height {
             for x in 0..self.width {
                 let index = y * self.width + x;
