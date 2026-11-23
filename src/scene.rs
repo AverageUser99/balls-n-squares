@@ -4,6 +4,33 @@ use std::cell::Cell;
 pub const EPS: f32 = 0.001;
 pub const LIGHT_Y: f32 = 4.98;
 pub const LIGHT: Vec3 = Vec3::new(14.0, 12.8, 10.5);
+const PANEL_WIDTH: f32 = 1.8;
+const PANEL_DEPTH: f32 = 1.6;
+const PANEL_AREA_PI: f32 = PANEL_WIDTH * PANEL_DEPTH / std::f32::consts::PI;
+
+// Stable world-space placement: no frame RNG, per-camera list, or light spawning.
+// A panel's entire local illumination footprint fits inside its 16-unit cell.
+fn floor_panel(p: Vec3) -> Option<Vec3> {
+    let x = (p.x / 16.0 + 0.5).floor() as i32;
+    let z = (p.z / 16.0 + 0.5).floor() as i32;
+    if x == 0 && z == 0 {
+        return None;
+    }
+    let mut hash = (x as u32).wrapping_mul(0x9e3779b9) ^ (z as u32).wrapping_mul(0x85ebca6b);
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x7feb352d);
+    hash ^= hash >> 15;
+    let jitter = |bits| (bits as f32 / 65535.0 - 0.5) * 4.0;
+    Some(Vec3::new(
+        x as f32 * 16.0 + jitter(hash & 65535),
+        0.0,
+        z as f32 * 16.0 + jitter(hash >> 16),
+    ))
+}
+fn on_panel(p: Vec3, x: f32, z: f32) -> bool {
+    (p.x - x).abs() < PANEL_WIDTH * 0.5 && (p.z - z).abs() < PANEL_DEPTH * 0.5
+}
+
 pub const TINT: Vec3 = Vec3::new(0.94, 0.96, 0.98);
 pub const EMITTER: usize = 11;
 pub const MIRROR: usize = 12;
@@ -290,7 +317,9 @@ pub fn trace(o: Vec3, d: Vec3) -> Hit {
         } else {
             normal(h.surface)
         };
-        if h.surface == 1 && h.point.x.abs() < 0.9 && (h.point.z + 0.65).abs() < 0.8 {
+        if (h.surface == 1 && on_panel(h.point, 0.0, -0.65))
+            || (h.surface == 0 && floor_panel(h.point).is_some_and(|c| on_panel(h.point, c.x, c.z)))
+        {
             h.surface = EMITTER;
         }
     }
@@ -314,12 +343,41 @@ pub fn occluded(o: Vec3, segment: Vec3) -> bool {
 
 pub fn direct(point: Vec3, id: usize, u: f32, v: f32) -> Vec3 {
     let o = point + normal(id) * EPS;
-    let segment = Vec3::new((u - 0.5) * 1.8, LIGHT_Y, -0.65 + (v - 0.5) * 1.6) - o;
+    let segment = Vec3::new(
+        (u - 0.5) * PANEL_WIDTH,
+        LIGHT_Y,
+        -0.65 + (v - 0.5) * PANEL_DEPTH,
+    ) - o;
     let cos_product = normal(id).dot(segment).max(0.0) * segment.y.max(0.0);
     let mut result = Vec3::default();
     if cos_product > 0.0 && !occluded(o, segment) {
         let d2 = segment.dot(segment);
-        result = LIGHT * (cos_product * (2.88 / std::f32::consts::PI) / (d2 * d2));
+        result = LIGHT * (cos_product * PANEL_AREA_PI / (d2 * d2));
+    }
+    // Only the nearby upward-facing floor panel can contribute. Fade the
+    // horizontal cutoff so moving across a cell edge never switches light abruptly.
+    if id != 0 && o.y > EPS {
+        if let Some(center) = floor_panel(o) {
+            let dx = o.x - center.x;
+            let dz = o.z - center.z;
+            let fade = ((36.0 - dx * dx - dz * dz) / 11.0).clamp(0.0, 1.0);
+            if fade > 0.0 {
+                let sample =
+                    center + Vec3::new((u - 0.5) * PANEL_WIDTH, 0.0, (v - 0.5) * PANEL_DEPTH);
+                let segment = sample - o;
+                let cosine = normal(id).dot(segment) * o.y;
+                let crosses = |a: f32, b: f32, wall: f32| (a - wall) * (b - wall) < 0.0;
+                if cosine > 0.0
+                    && !crosses(o.x, sample.x, -3.0)
+                    && !crosses(o.x, sample.x, 3.0)
+                    && !crosses(o.z, sample.z, -3.0)
+                    && !occluded(o, segment)
+                {
+                    let d2 = segment.dot(segment);
+                    result = result + LIGHT * (fade * cosine * PANEL_AREA_PI / (d2 * d2));
+                }
+            }
+        }
     }
     // Sample a uniformly selected triangular face, then sample its area uniformly.
     let face_sample = u * 3.0;

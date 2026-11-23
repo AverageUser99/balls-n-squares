@@ -164,6 +164,44 @@ impl Default for Renderer {
     }
 }
 impl Renderer {
+    pub fn set_bounces(&mut self, n: i32) {
+        let bounces = n.clamp(0, 8) as u32;
+        if self.lighting.bounces == bounces {
+            return;
+        }
+        self.lighting.bounces = bounces;
+        self.lighting.ready = false;
+        self.lighting.values.fill(Vec3::default());
+        if self.live {
+            self.live_cache.prepare(bounces);
+        }
+        if self.width != 0 {
+            self.resize(self.width, self.full_height, self.y_start, self.height);
+        }
+    }
+    fn indirect(&mut self, id: usize, point: Vec3, seed: u32) -> Vec3 {
+        let bounces = self.lighting.bounces;
+        if bounces == 0 {
+            return Vec3::default();
+        }
+        let cached = if self.live {
+            self.live_cache.lookup(id, point)
+        } else if self.options & 1 == 0 {
+            self.lighting.lookup(id, point)
+        } else {
+            None
+        };
+        cached.unwrap_or_else(|| {
+            let mut rng = Rng::new(seed);
+            let d = sampling::cosine(id, rng.next(), rng.next());
+            clamp_indirect(lighting::indirect(
+                point + normal(id) * EPS,
+                d,
+                &mut rng,
+                bounces,
+            ))
+        })
+    }
     pub fn options(&mut self, options: u32) {
         self.options = options;
     }
@@ -171,7 +209,7 @@ impl Renderer {
         self.live = true;
         self.mode_changed |= self.preview != preview;
         self.preview = preview;
-        self.live_cache.prepare();
+        self.live_cache.prepare(self.lighting.bounces);
         self.lighting.ready = false;
     }
     pub fn resize(&mut self, width: usize, full_height: usize, y_start: usize, height: usize) {
@@ -231,15 +269,7 @@ impl Renderer {
                     PYRAMID => PYRAMID_LIGHT,
                     // Fixed direct sample; the bounced term is shared with still frames.
                     id if id < SURFACES => {
-                        let indirect = self.live_cache.lookup(id, hit.point).unwrap_or_else(|| {
-                            let mut rng = Rng::new(id as u32);
-                            let d = sampling::cosine(id, rng.next(), rng.next());
-                            clamp_indirect(lighting::one_bounce(
-                                hit.point + normal(id) * EPS,
-                                d,
-                                &mut rng,
-                            ))
-                        });
+                        let indirect = self.indirect(id, hit.point, id as u32);
                         (direct(hit.point, id, 0.5, 0.5) + indirect) * albedo(id)
                     }
                     _ => Vec3::default(),
@@ -309,30 +339,8 @@ impl Renderer {
                         pixel.count / AA as u32,
                         global ^ (slot as u32).wrapping_mul(0x9e3779b9) ^ 0xb5297a4d,
                     );
-                    let mut incoming = direct(hit.point, id, u, v);
-                    let cached = if self.live {
-                        self.live_cache.lookup(id, hit.point)
-                    } else if self.options & 1 == 0 {
-                        self.lighting.lookup(id, hit.point)
-                    } else {
-                        None
-                    };
-                    let indirect = match cached {
-                        Some(value) => value,
-                        None => {
-                            let mut rng =
-                                Rng::new(global.wrapping_mul(512).wrapping_add(pixel.count));
-                            let d = sampling::cosine(id, rng.next(), rng.next());
-                            lighting::one_bounce(hit.point + normal(id) * EPS, d, &mut rng)
-                        }
-                    };
-                    // Cached values are already averaged; clamp individual paths only.
-                    incoming = incoming
-                        + if cached.is_some() {
-                            indirect
-                        } else {
-                            clamp_indirect(indirect)
-                        };
+                    let seed = global.wrapping_mul(512).wrapping_add(pixel.count);
+                    let incoming = direct(hit.point, id, u, v) + self.indirect(id, hit.point, seed);
                     color = incoming * albedo(id);
                 }
                 self.state[index].add(color * hit.tint(), self.options & 2 == 0);

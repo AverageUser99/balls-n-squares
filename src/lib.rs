@@ -101,6 +101,10 @@ pub extern "C" fn active_pixels() -> u32 {
 pub extern "C" fn evaluated_samples() -> u32 {
     RENDERER.with(|s| s.borrow().evaluated)
 }
+#[no_mangle]
+pub extern "C" fn set_bounces(n: i32) {
+    RENDERER.with(|s| s.borrow_mut().set_bounces(n));
+}
 // Test/benchmark controls: 1=no irradiance cache, 2=no adaptation, 4=no denoising,
 // 8=retrace primary geometry. Defaults enable every optimization.
 #[no_mangle]
@@ -133,7 +137,7 @@ pub extern "C" fn simd_enabled() -> u32 {
 }
 
 // Cache files are bound to the exact integrator/geometry source, not just dimensions.
-const fn signature() -> u32 {
+const fn source_signature() -> u32 {
     let sources = [
         include_str!("scene.rs"),
         include_str!("lighting.rs"),
@@ -153,9 +157,13 @@ const fn signature() -> u32 {
     }
     hash
 }
+fn signature(bounces: u32) -> u32 {
+    const SOURCE: u32 = source_signature();
+    (SOURCE ^ bounces).wrapping_mul(16777619)
+}
 #[no_mangle]
 pub extern "C" fn cache_signature() -> u32 {
-    signature()
+    RENDERER.with(|s| signature(s.borrow().lighting.bounces))
 }
 
 // Optional build-time acceleration. It uses exactly the same compiled Rust integrator.
@@ -165,7 +173,12 @@ pub fn bake_file(destination: &std::path::Path, samples: u32) -> std::io::Result
     let mut cache = lighting::Lighting::default();
     cache.bake(0, scene::TEXELS, samples);
     let mut file = std::io::BufWriter::new(std::fs::File::create(destination)?);
-    for word in [0x31434c57u32, signature(), scene::TEXELS as u32, 4] {
+    for word in [
+        0x31434c57u32,
+        signature(cache.bounces),
+        scene::TEXELS as u32,
+        4,
+    ] {
         file.write_all(&word.to_le_bytes())?;
     }
     for value in cache.values {
